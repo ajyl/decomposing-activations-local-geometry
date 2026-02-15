@@ -15,7 +15,7 @@ click
 comm
 contourpy
 cycler
-datasets
+datasets >=2.20.0
 debugpy
 decorator
 dill
@@ -90,7 +90,7 @@ torch
 tornado
 tqdm
 traitlets
-transformer-lens
+transformer-lens >=2.16
 transformers
 transformers-stream-generator
 typeguard
