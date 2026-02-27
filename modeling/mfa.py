@@ -7,16 +7,17 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 
+
 class MFA(nn.Module):
     def __init__(
         self,
-        centroids: torch.Tensor, # (K, D) initial mu_k
+        centroids: torch.Tensor,  # (K, D) initial mu_k
         *,
-        rank: int, # q
-        psi_init: float = 1.0, # initial diagonal unique variance
-        psi_per_component: bool = False, # True => Psi_k per component; False => shared Psi
-        scale_init: float = 1.0, # initial loading scales s_{k,j}
-        eps_floor: float = 1e-5, # numerical floor for positivity / norms
+        rank: int,  # q
+        psi_init: float = 1.0,  # initial diagonal unique variance
+        psi_per_component: bool = False,  # True => Psi_k per component; False => shared Psi
+        scale_init: float = 1.0,  # initial loading scales s_{k,j}
+        eps_floor: float = 1e-5,  # numerical floor for positivity / norms
     ):
         super().__init__()
         if centroids.ndim != 2:
@@ -51,10 +52,10 @@ class MFA(nn.Module):
         self.pi_logits = nn.Parameter(torch.zeros(K, dtype=centroids.dtype))
 
         eye = torch.eye(self.q, dtype=centroids.dtype)
-        self.register_buffer("_rot_T", eye.repeat(K, 1, 1))        # (K,q,q)
-        self.register_buffer("_rot_inv_Tt", eye.repeat(K, 1, 1))   # (K,q,q)
+        self.register_buffer("_rot_T", eye.repeat(K, 1, 1))  # (K,q,q)
+        self.register_buffer("_rot_inv_Tt", eye.repeat(K, 1, 1))  # (K,q,q)
         self._rotation_on: bool = False
-        self._rotation_kind: Optional[str] = None    # 'oblimin' or None
+        self._rotation_kind: Optional[str] = None  # 'oblimin' or None
         self._rotation_params: dict = {}
 
     def _psi(self) -> torch.Tensor:
@@ -72,9 +73,9 @@ class MFA(nn.Module):
         return F.softplus(self.scale_rho)
 
     def _W(self) -> torch.Tensor:
-        d_hat = self._dir_hat()                 # (K, D, q)
-        s = self._scale()                       # (K, q)
-        return d_hat * s[:, None, :]            # (K, D, q)
+        d_hat = self._dir_hat()  # (K, D, q)
+        s = self._scale()  # (K, q)
+        return d_hat * s[:, None, :]  # (K, D, q)
 
     def _W_rotated(self, W: torch.Tensor) -> torch.Tensor:
         # L = A @ inv(T.T)
@@ -91,13 +92,19 @@ class MFA(nn.Module):
         Sz_rot = torch.matmul(Tt, torch.matmul(Sz, T))
         return Ez_rot, Sz_rot
 
-
     @property
     def W(self) -> torch.Tensor:
         W = self._W()
         return self._W_rotated(W) if self._rotation_on else W
 
-    def _core(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _core(self, x: torch.Tensor) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """
         Args:
             x: (B, D)
@@ -108,41 +115,43 @@ class MFA(nn.Module):
         if D != self.D:
             raise ValueError(f"expected input dim {self.D}, got {D}")
 
-        psi     = self._psi() # (K, D)
-        psi_inv = 1.0 / psi # (K, D)
-        W       = self._W() # (K, D, q)  (unrotated)
+        psi = self._psi()  # (K, D)
+        psi_inv = 1.0 / psi  # (K, D)
+        W = self._W()  # (K, D, q)  (unrotated)
 
-        A = W * psi_inv[:, :, None].sqrt() # (K, D, q)
-        M = torch.einsum("kdi,kdj->kij", A, A) # (K, q, q)
+        A = W * psi_inv[:, :, None].sqrt()  # (K, D, q)
+        M = torch.einsum("kdi,kdj->kij", A, A)  # (K, q, q)
         Iq = torch.eye(self.q, dtype=W.dtype, device=W.device)
         M = M + Iq[None, :, :]
-        L = torch.linalg.cholesky(M) # (K, q, q)
+        L = torch.linalg.cholesky(M)  # (K, q, q)
 
-        xT_Pinv_x   = torch.einsum("bd,kd->bk", x * x, psi_inv) # (B, K)
-        xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,        psi_inv * self.mu) # (B, K)
-        muT_Pinv_mu = (self.mu * self.mu * psi_inv).sum(dim=-1) # (K,)
-        xPsiInvx    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :] # (B, K)
+        xT_Pinv_x = torch.einsum("bd,kd->bk", x * x, psi_inv)  # (B, K)
+        xT_Pinv_mu = torch.einsum("bd,kd->bk", x, psi_inv * self.mu)  # (B, K)
+        muT_Pinv_mu = (self.mu * self.mu * psi_inv).sum(dim=-1)  # (K,)
+        xPsiInvx = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]  # (B, K)
 
-        PinvW      = psi_inv[:, :, None] * W # (K, D, q)
-        WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x, PinvW) # (B, K, q)
-        WT_Pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW) # (K, q)
-        v          = WT_Pinv_x - WT_Pinv_mu[None, :, :] # (B, K, q)
+        PinvW = psi_inv[:, :, None] * W  # (K, D, q)
+        WT_Pinv_x = torch.einsum("bd,kdq->bkq", x, PinvW)  # (B, K, q)
+        WT_Pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW)  # (K, q)
+        v = WT_Pinv_x - WT_Pinv_mu[None, :, :]  # (B, K, q)
 
-        v_perm = v.permute(1, 2, 0) # (K, q, B)
-        Ez_perm = torch.cholesky_solve(v_perm, L, upper=False)# (K, q, B)
-        Ez = Ez_perm.permute(2, 0, 1) # (B, K, q)
+        v_perm = v.permute(1, 2, 0)  # (K, q, B)
+        Ez_perm = torch.cholesky_solve(v_perm, L, upper=False)  # (K, q, B)
+        Ez = Ez_perm.permute(2, 0, 1)  # (B, K, q)
 
         Iq_expand = Iq.expand(self.K, self.q, self.q).clone()
         Sz = torch.cholesky_solve(Iq_expand, L, upper=False)  # (K, q, q)
 
-        logdet_Psi = torch.log(psi).sum(dim=-1) # (K,)
+        logdet_Psi = torch.log(psi).sum(dim=-1)  # (K,)
         logdet_M = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)  # (K,)
-        logdet_C = logdet_Psi + logdet_M # (K,)
+        logdet_C = logdet_Psi + logdet_M  # (K,)
 
-        vMinvv = (v * Ez).sum(dim=-1) # (B, K)
-        quad = xPsiInvx - vMinvv # (B, K)
+        vMinvv = (v * Ez).sum(dim=-1)  # (B, K)
+        quad = xPsiInvx - vMinvv  # (B, K)
 
-        ll = -0.5 * (self.D * math.log(2.0 * math.pi) + logdet_C[None, :] + quad) # (B, K)
+        ll = -0.5 * (
+            self.D * math.log(2.0 * math.pi) + logdet_C[None, :] + quad
+        )  # (B, K)
         return ll, Ez, Sz, L, v, psi
 
     def responsibilities(self, x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
@@ -165,23 +174,26 @@ class MFA(nn.Module):
     def component_posterior(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         _ll, Ez, Sz, *_ = self._core(x)
         Ez, Sz = self._maybe_rotate_scores(Ez, Sz)
-        return Ez, Sz 
+        return Ez, Sz
 
-    def reconstruct(self, x: torch.Tensor, *, use_mixture_mean: bool = True) -> torch.Tensor:
+    def reconstruct(
+        self, x: torch.Tensor, *, use_mixture_mean: bool = True
+    ) -> torch.Tensor:
         ll, Ez, _Sz, _L, _v, _psi = self._core(x)
         # Use rotated view if enabled
         W_eff = self.W
         if self._rotation_on:
             Ez, _ = self._maybe_rotate_scores(Ez, _Sz)
-        comp = self.mu[None, :, :] + torch.einsum("kdq,bkq->bkd", W_eff, Ez) # (B,K,D)
+        comp = self.mu[None, :, :] + torch.einsum("kdq,bkq->bkd", W_eff, Ez)  # (B,K,D)
         if not use_mixture_mean:
             return comp
         log_pi = F.log_softmax(self.pi_logits, dim=0)[None, :]
-        alpha = F.softmax(ll + log_pi, dim=1) # (B,K)
-        return torch.einsum("bk,bkd->bd", alpha, comp) # (B,D)
+        alpha = F.softmax(ll + log_pi, dim=1)  # (B,K)
+        return torch.einsum("bk,bkd->bd", alpha, comp)  # (B,D)
 
     def forward(self, x):
         return self.nll(x)
+
 
 def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
     """
@@ -194,7 +206,7 @@ def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -
         "psi_per_component": model.psi_per_component,
         "eps_floor": model._eps,
         "dtype": str(model.mu.dtype),
-        "version": 1, 
+        "version": 1,
         "rotation_on": bool(getattr(model, "_rotation_on", False)),
         "rotation_kind": getattr(model, "_rotation_kind", None),
         "rotation_params": getattr(model, "_rotation_params", {}),
@@ -204,7 +216,7 @@ def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -
 
     torch.save(
         {
-            "state_dict": model.state_dict(), # includes rotation buffers if present
+            "state_dict": model.state_dict(),  # includes rotation buffers if present
             "meta": meta,
         },
         path,
@@ -229,14 +241,15 @@ def load_mfa(
         meta = {}
 
     # Infer shapes
-    mu = state["mu"] # (K, D)
-    dir_raw = state["dir_raw"] # (K, D, q)
+    mu = state["mu"]  # (K, D)
+    dir_raw = state["dir_raw"]  # (K, D, q)
     K, D = mu.shape
     q = dir_raw.shape[-1]
 
-    psi_rho = state["psi_rho"] # (K, D) or (D,)
-    psi_per_component = bool(meta.get("psi_per_component",
-                                      psi_rho.ndim == 2 and psi_rho.shape[0] == K))
+    psi_rho = state["psi_rho"]  # (K, D) or (D,)
+    psi_per_component = bool(
+        meta.get("psi_per_component", psi_rho.ndim == 2 and psi_rho.shape[0] == K)
+    )
     eps_floor = float(meta.get("eps_floor", 1e-8))
 
     centroids = torch.zeros(K, D, dtype=mu.dtype)
@@ -266,24 +279,27 @@ def load_mfa(
 
     return model
 
+
 @dataclass
 class EncodedBatch:
     """
     Encoded representation of a batch against an MFA dictionary.
     """
-    coeffs: torch.Tensor # (B, K*(1+q))
-    alpha: torch.Tensor # (B, K) responsibilities
-    z: torch.Tensor # (B, K, q) posterior means z_k aligned with dictionary
-    dictionary: torch.Tensor # (D, K*(1+q))  atoms: [mu_k | W_k columns] over k
-    recon: torch.Tensor # (B, D) coeffs @ dictionary.T
+
+    coeffs: torch.Tensor  # (B, K*(1+q))
+    alpha: torch.Tensor  # (B, K) responsibilities
+    z: torch.Tensor  # (B, K, q) posterior means z_k aligned with dictionary
+    dictionary: torch.Tensor  # (D, K*(1+q))  atoms: [mu_k | W_k columns] over k
+    recon: torch.Tensor  # (B, D) coeffs @ dictionary.T
     index_map: List[Tuple[int, Optional[int]]]
 
 
 class MFAEncoderDecoder:
     """
-    Encoder/decoder for MFA 
+    Encoder/decoder for MFA
 
     """
+
     def __init__(self, model):
         self.model = model
 
@@ -294,8 +310,10 @@ class MFAEncoderDecoder:
         return W, mu
 
     @torch.no_grad()
-    def build_dictionary(self) -> Tuple[torch.Tensor, List[Tuple[int, Optional[int]]], Optional[torch.Tensor]]:
-        W, mu = self._current_params() # (K,D,q), (K,D)
+    def build_dictionary(
+        self,
+    ) -> Tuple[torch.Tensor, List[Tuple[int, Optional[int]]], Optional[torch.Tensor]]:
+        W, mu = self._current_params()  # (K,D,q), (K,D)
         K, D, q = W.shape
         device, dtype = W.device, W.dtype
 
@@ -320,22 +338,22 @@ class MFAEncoderDecoder:
             raise ValueError(f"expected input dim {self.model.D}, got {D}")
 
         # Responsibilities and posterior means
-        alpha = self.model.responsibilities(x, tau=tau) # (B, K)
-        Ez, _Sz = self.model.component_posterior(x) # (B, K, q)
+        alpha = self.model.responsibilities(x, tau=tau)  # (B, K)
+        Ez, _Sz = self.model.component_posterior(x)  # (B, K, q)
 
         # Build dictionary
-        Dmat, index_map, _ = self.build_dictionary() # (D, K*(1+q))
+        Dmat, index_map, _ = self.build_dictionary()  # (D, K*(1+q))
 
         # assemble coefficient blocks
-        blocks = [] 
+        blocks = []
         for k in range(self.model.K):
-            ak = alpha[:, k:k+1] # (B,1)
-            zk = Ez[:, k, :] # (B,q)
-            blocks.append(torch.cat([ak, ak * zk], dim=1)) # (B,1+q)
-        coeffs = torch.cat(blocks, dim=1).to(Dmat.dtype) # (B, K*(1+q))
+            ak = alpha[:, k : k + 1]  # (B,1)
+            zk = Ez[:, k, :]  # (B,q)
+            blocks.append(torch.cat([ak, ak * zk], dim=1))  # (B,1+q)
+        coeffs = torch.cat(blocks, dim=1).to(Dmat.dtype)  # (B, K*(1+q))
 
         # Decode via single matmul
-        recon = (coeffs @ Dmat.T).to(x.dtype) # (B, D)
+        recon = (coeffs @ Dmat.T).to(x.dtype)  # (B, D)
 
         return EncodedBatch(
             coeffs=coeffs,

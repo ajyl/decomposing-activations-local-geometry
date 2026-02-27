@@ -170,10 +170,10 @@ centroids = X_all[idx]
 # %%
 
 
-from modeling.mfa import MFA
+from modeling.mfa import QKMFA
 from modeling.train import train_nll
 
-model = MFA(centroids=centroids, rank=10).to(model_device)
+model = QKMFA(centroids=centroids, rank=10).to(model_device)
 train_nll(model, loader, epochs=10, lr=1e-3)
 
 

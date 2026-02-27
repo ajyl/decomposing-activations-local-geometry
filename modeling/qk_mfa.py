@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 
 
-class MFA(nn.Module):
+class QKMFA(nn.Module):
     def __init__(
         self,
         q_centroids: torch.Tensor,  # (n_components, d_head) initial mu_k
@@ -60,11 +60,18 @@ class MFA(nn.Module):
         # Diagonal unique variances Psi
         psi_shape = (n_components, d_head) if psi_per_component else (d_head,)
         rho0 = math.log(math.exp(float(psi_init)) - 1.0)
-        self.psi_rho = nn.Parameter(torch.full(psi_shape, rho0, dtype=q_centroids.dtype))
+        self.psi_q_rho = nn.Parameter(
+            torch.full(psi_shape, rho0, dtype=q_centroids.dtype)
+        )
+        self.psi_k_rho = nn.Parameter(
+            torch.full(psi_shape, rho0, dtype=q_centroids.dtype)
+        )
         self.psi_per_component = bool(psi_per_component)
 
         # Mixture weights (n_components,)
-        self.pi_logits = nn.Parameter(torch.zeros(n_components, dtype=q_centroids.dtype))
+        self.pi_logits = nn.Parameter(
+            torch.zeros(n_components, dtype=q_centroids.dtype)
+        )
 
         eye = torch.eye(self.rank, dtype=q_centroids.dtype)
         self.register_buffer(
@@ -75,8 +82,6 @@ class MFA(nn.Module):
         )  # (n_components, rank, rank)
 
         self._rotation_on: bool = False
-        self._rotation_kind: Optional[str] = None  # 'oblimin' or None
-        self._rotation_params: dict = {}
 
     def _psi(self) -> torch.Tensor:
         psi = F.softplus(self.psi_rho) + self._eps
@@ -240,8 +245,6 @@ def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -
         "dtype": str(model.mu.dtype),
         "version": 1,
         "rotation_on": bool(getattr(model, "_rotation_on", False)),
-        "rotation_kind": getattr(model, "_rotation_kind", None),
-        "rotation_params": getattr(model, "_rotation_params", {}),
     }
     if extra:
         meta["extra"] = extra
@@ -303,8 +306,6 @@ def load_mfa(
     model.load_state_dict(state, strict=strict)
 
     model._rotation_on = bool(meta.get("rotation_on", False))
-    model._rotation_kind = meta.get("rotation_kind", None)
-    model._rotation_params = meta.get("rotation_params", {})
 
     if device is not None:
         model = model.to(device)
