@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
+from fancy_einsum import einsum
 
 
 class MFA(nn.Module):
@@ -106,10 +107,19 @@ class MFA(nn.Module):
         torch.Tensor,
     ]:
         """
+        We care about log p(z | (x-mu_k)), which comes from a
+        Gaussian N(Mu_{z|y}, \Sigma_{z|y}) where y = x - mu_k.
+
+        Mu_{z|y} = M^{-1} @ v, where
+        M = (I_rank + W^T @ Psi^{-1} @ W),
+        v = W^T @ Psi^{-1} @ y
+
+        \Sigma_{z|y} = M^{-1}
+
         Args:
             x: (B, D)
         Returns:
-            ll, Ez, Sz, L, v, psi
+            log_likelihoods, Ez, Sz, L, v, psi
         """
         B, D = x.shape
         if D != self.D:
@@ -119,40 +129,66 @@ class MFA(nn.Module):
         psi_inv = 1.0 / psi  # (K, D)
         W = self._W()  # (K, D, q)  (unrotated)
 
+        breakpoint()
+        # Note that psi_inv is diagonal, so we can do W^T @ Psi^{-1} @ W
+        # efficiently by scaling rows of W by psi_inv.sqrt (W * psi_inv.sqrt()
+        # and then doing W^T @ scaled_W
+
+        # 1) First, solve for M.
+
+        # Scale W by psi_inv.sqrt().
         A = W * psi_inv[:, :, None].sqrt()  # (K, D, q)
+
+        # W^T Psi^{-1/2}^T @ Psi^{-1/2} W
+        # = W^T @ Psi^{-1} @ W
+        # = A^T @ A
         M = torch.einsum("kdi,kdj->kij", A, A)  # (K, q, q)
         Iq = torch.eye(self.q, dtype=W.dtype, device=W.device)
         M = M + Iq[None, :, :]
-        L = torch.linalg.cholesky(M)  # (K, q, q)
 
-        xT_Pinv_x = torch.einsum("bd,kd->bk", x * x, psi_inv)  # (B, K)
-        xT_Pinv_mu = torch.einsum("bd,kd->bk", x, psi_inv * self.mu)  # (B, K)
-        muT_Pinv_mu = (self.mu * self.mu * psi_inv).sum(dim=-1)  # (K,)
-        xPsiInvx = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]  # (B, K)
-
+        # 2) Solve for v (i.e., W_k^\top \psi^_{-1} (x-\mu_k)).
         PinvW = psi_inv[:, :, None] * W  # (K, D, q)
         WT_Pinv_x = torch.einsum("bd,kdq->bkq", x, PinvW)  # (B, K, q)
         WT_Pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW)  # (K, q)
         v = WT_Pinv_x - WT_Pinv_mu[None, :, :]  # (B, K, q)
 
+        # First solve for (x-mu_k)^\top @ Psi^{-1} @ (x-mu_k).
+        # However, x-mu_k is (B, K, r), so we do in parts:
+        # x^_Pinv_x - 2 x^T @ Psi^{-1} @ mu_k + mu_k^T @ Psi^{-1} @ mu_k
+        # (which have shapes (B, K), (B, K), (K,))
+
+        # x^T @ Psi^{-1} @ x (but because Psi is diagonal:)
+        # = \Sum_i (x_i^2 / psi_i)
+        # AKA, x^\top diag(a) x = (a * (x * x)).sum()
+
+        # Solve for E_z = M^{-1} @ v and Sigma_z = M^{-1} using Cholesky decomposition of M.
+        L = torch.linalg.cholesky(M)  # (K, q, q)
         v_perm = v.permute(1, 2, 0)  # (K, q, B)
         Ez_perm = torch.cholesky_solve(v_perm, L, upper=False)  # (K, q, B)
-        Ez = Ez_perm.permute(2, 0, 1)  # (B, K, q)
+        E_z = Ez_perm.permute(2, 0, 1)  # (B, K, q)
 
         Iq_expand = Iq.expand(self.K, self.q, self.q).clone()
-        Sz = torch.cholesky_solve(Iq_expand, L, upper=False)  # (K, q, q)
+        Sigma_z = torch.cholesky_solve(Iq_expand, L, upper=False)  # (K, q, q)
 
+        # Now solve for p(z | x), which requires the log determinant of the covariance of p(z | x), which is M^{-1} @ Psi.
+        # |C_k| = |W_k W_k^T + Psi_k| = |Psi_k| * |I + W_k^T Psi^{-1} W_k| = |Psi_k| * |M|
+        # log |C_k| = log |Psi_k| + log |M_k|
         logdet_Psi = torch.log(psi).sum(dim=-1)  # (K,)
         logdet_M = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)  # (K,)
         logdet_C = logdet_Psi + logdet_M  # (K,)
 
-        vMinvv = (v * Ez).sum(dim=-1)  # (B, K)
-        quad = xPsiInvx - vMinvv  # (B, K)
+        xT_Pinv_x = torch.einsum("bd,kd->bk", x * x, psi_inv)  # (B, K)
+        xT_Pinv_mu = torch.einsum("bd,kd->bk", x * self.mu, psi_inv)  # (B, K)
+        muT_Pinv_mu = (self.mu * self.mu * psi_inv).sum(dim=-1)  # (K,)
+        x_Pinv_x = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]  # (B, K)
 
-        ll = -0.5 * (
+        v_Minv_v = (v * E_z).sum(dim=-1)  # (B, K)
+        quad = x_Pinv_x - v_Minv_v  # (B, K)
+
+        log_likelihoods = -0.5 * (
             self.D * math.log(2.0 * math.pi) + logdet_C[None, :] + quad
         )  # (B, K)
-        return ll, Ez, Sz, L, v, psi
+        return log_likelihoods, E_z, Sigma_z, L, v, psi
 
     def responsibilities(self, x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
         ll, *_ = self._core(x)
