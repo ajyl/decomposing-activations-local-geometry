@@ -20,14 +20,13 @@ resid_mid_module_name = "model.layers.{}.hook_resid_mid"
 resid_post_module_name = "model.layers.{}.hook_resid_post"
 
 
-def to_tokens(model, tokenizer, input_):
+def to_tokens(tokenizer, input_):
     return tokenizer(
         input_,
         return_tensors="pt",
         padding=True,
-        truncation=True,
-        max_length=4096,
-    )["input_ids"]
+        max_length=64,
+    )
 
 
 class QKGenerator(ActivationGenerator):
@@ -64,7 +63,7 @@ class QKGenerator(ActivationGenerator):
         self.data_device = data_device
         self._mode = mode
 
-    def _get_data_as_tensors(self, dataset: ConceptDataset, batch_size: int):
+    def _tokenize_data(self, dataset: ConceptDataset, batch_size: int):
         """
         Converts data from the ConceptDataset into model-ready tensors.
         Assumes that the dataset yields (prompts, labels) and uses left padding.
@@ -72,116 +71,161 @@ class QKGenerator(ActivationGenerator):
         data = []
         for batch in dataset.get_batches(batch_size=batch_size):
             prompts = batch["prompt"]
-            tokens = to_tokens(self.model, self.model.tokenizer, prompts)
-            data.append(tokens)
+            tokenized = to_tokens(self.model.tokenizer, prompts)
+            data.append(
+                {
+                    "input_ids": tokenized["input_ids"],
+                    "attention_mask": tokenized["attention_mask"],
+                }
+            )
         return data
 
-    def _get_module_name(self, layer_number, key_or_query):
-        if key_or_query == "key":
+    def _get_module_name(self, layer_number, module):
+        if module == "key":
             return key_module_name.format(layer_number)
-        elif key_or_query == "query":
+        elif module == "query":
             return query_module_name.format(layer_number)
+        elif module == "attn_pattern":
+            return attn_module_name.format(layer_number)
         else:
-            raise ValueError(
-                f"Invalid key_or_query: {key_or_query}. Must be 'key' or 'query'."
-            )
+            raise ValueError(f"Invalid module {module}.")
 
     @torch.no_grad()
-    def generate_multiple_layer_activations_and_freq(
+    def generate_query_key_vecs(
         self,
         dataset: Union[ConceptDataset, SupervisedConceptDataset],
         heads: List[Tuple[int, int]],
         batch_size: int = 16,
+        top_k: int = 8,
+        attn_min: float = 0.01,
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
-        For each sample in the dataset, returns the activations from multiple layers
-        and a frequency vector corresponding to each non-padding token.
-
-        The output for each layer is a tensor of shape:
-            (num_tokens, d_model)
-        where num_tokens is the total number of non-padding tokens across the dataset.
-        The frequency vector (of shape (num_tokens,)) is built from a vocabulary frequency
-        computed over the dataset.
+        For each sample in the dataset, returns the queries and keys from specified heads.
 
         Args:
             dataset (ConceptDataset): Dataset yielding samples.
-            heads (List[Tuple[int, int]]): List of layer numbers to extract activations from.
+            heads (List[Tuple[int, int]]): List of head indices to collect query, keys from.
             batch_size (int): Batch size for processing the dataset.
 
         Returns:
-            A tuple (final_activations, freq) where:
-              - final_activations: List of tensors, one per layer, each of shape (num_tokens, d_model).
-              - freq: Tensor of shape (num_tokens,), where each entry is the frequency of that token.
+            A tuple (query_vecs, key_vecs).
         """
+        self.model.eval()
+        d_head = self.model.config.head_dim
         n_heads = self.model.config.num_attention_heads
         num_kv_groups = self.model.model.layers[0].self_attn.num_key_value_groups
 
-        # Build the global vocabulary frequency dictionary.
-        vocab_freq = self.build_vocab_frequency(dataset, batch_size=batch_size)
-
-        data = self._get_data_as_tensors(dataset, batch_size)
+        data = self._tokenize_data(dataset, batch_size)
         all_queries = [[] for _ in heads]
         all_keys = [[] for _ in heads]
+        all_weights = [[] for _ in heads]
         all_masks = []
-        all_token_ids = []
 
-        record_module_names = [
-            self._get_module_name(layer, "key") for (layer, _) in heads
-        ] + [self._get_module_name(layer, "query") for (layer, _) in heads]
+        layers = sorted(set(layer for layer, _ in heads))
+        record_module_names = (
+            [self._get_module_name(layer, "key") for layer in layers]
+            + [self._get_module_name(layer, "query") for layer in layers]
+            + [self._get_module_name(layer, "attn_pattern") for layer in layers]
+        )
 
-        for batch in tqdm(data, desc="Generating multi-layer activations with freq"):
-            if isinstance(batch, dict):
-                inputs = {k: v.to(self.data_device) for k, v in batch.items()}
-                input_ids = inputs["input_ids"]
-            else:
-                input_ids = batch.to(self.data_device)
-                inputs = None
+        for batch in tqdm(data, desc="Gathering query, key vectors..."):
+            input_ids = batch["input_ids"].to(self.data_device)
+            attention_mask = batch["attention_mask"].to(self.data_device)
 
             # Run the model and obtain cache.
             with record_activations(self.model, record_module_names) as cache:
-                self.model(input_ids)
-
-            # Create mask for non-padding tokens.
-            pad_token_id = self.model.tokenizer.pad_token_id
-            mask = input_ids != pad_token_id
-            all_masks.append(mask.cpu())
+                self.model(input_ids=input_ids, attention_mask=attention_mask)
 
             # Extract non-padding token IDs.
-            nonpad_ids = input_ids[mask.bool()].view(-1)
-            all_token_ids.append(nonpad_ids.cpu())
+            # nonpad_ids = input_ids[mask.bool()].view(-1)
+            mask = attention_mask.bool()
+            B, seq = input_ids.shape
+            pos_q = (
+                torch.arange(seq, device=input_ids.device)
+                .view(1, seq, 1)
+                .expand(B, seq, top_k)
+            )  # (B, seq, top_k)
 
             for idx, (layer, head_idx) in enumerate(heads):
-                key_module = self._get_module_name(layer, "key")
                 query_module = self._get_module_name(layer, "query")
-                # Get activations: shape (batch_size, seq_len, d_model)
+                key_module = self._get_module_name(layer, "key")
+                attn_module = self._get_module_name(layer, "attn_pattern")
+
                 # [batch, seq, d_head]
+                queries = cache[query_module][0][:, head_idx, :, :].contiguous()
                 keys = repeat_kv(cache[key_module][0], num_kv_groups)[
                     :, head_idx, :, :
                 ].contiguous()
-                # [batch, seq, d_head]
-                queries = cache[query_module][0][:, head_idx, :, :].contiguous()
-                # Immediately move activations to CPU.
-                all_queries[idx].append(keys.cpu())
-                all_keys[idx].append(queries.cpu())
+                attn_pattern = cache[attn_module][0][
+                    :, head_idx, :, :
+                ].contiguous()  # [batch, seq, seq]
 
-            del cache
-            torch.cuda.empty_cache()
+                attn_masked = attn_pattern.masked_fill(
+                    ~mask[:, None, :].bool(), float("-inf")
+                )
 
-        # Concatenate activations for each layer and token IDs.
-        final_queries = [
-            torch.cat(queries, dim=0) for queries in all_queries
-        ]
-        final_keys = [
-            torch.cat(keys, dim=0) for keys in all_keys
-        ]
-        final_masks = [
-            torch.cat(masks, dim=0) for masks in all_masks
-        ]
-        breakpoint()
-        token_ids_all = torch.cat(all_token_ids, dim=0)
-        # Build the frequency vector: for each token in token_ids_all, look up its global frequency.
-        freq = torch.tensor([vocab_freq[token.item()] for token in token_ids_all])
-        return final_activations, freq
+                _top_k = min(top_k, seq)
+                top_v, top_i = torch.topk(attn_masked, k=_top_k, dim=-1)
+
+                pos_q_h = pos_q
+                if _top_k != top_k:
+                    # shrink the precomputed grid view for this head only
+                    pos_q_h = (
+                        torch.arange(seq, device=input_ids.device)
+                        .view(1, seq, 1)
+                        .expand(B, seq, _top_k)
+                    )
+
+                causal_mask = top_i <= pos_q_h
+
+                # Key validity mask at selected indices
+                # mask_keys[b,t,j] = mask[b, top_i[b,t,j]]
+                # [B, seq, top_k] gather from [B, seq] using indices [B, seq, top_k]
+                mask_keys = mask.gather(dim=1, index=top_i.reshape(B, -1)).reshape(
+                    B, seq, _top_k
+                )
+                # Should be all 1s, i.e., all selected keys are valid (non-padding)
+                # assert mask_keys.all().item()
+
+                mask_queries = mask[:, :, None].expand(B, seq, _top_k)
+
+                # Edge validity + optional attention threshold
+                # final_mask[b,t,j] = mask[b,t] & mask[b, top_i[b,t,j]] & causal_mask[b,t,j] & (top_v[b,t,j] > attn_min)
+                final_mask = mask_queries & mask_keys & causal_mask & (top_v > attn_min)
+                if not final_mask.any():
+                    breakpoint()
+
+                # Gather key vectors for selected key positions
+                # k: (B,seq,d), top_i: (B,seq,_top_k)
+                k_gather = keys.gather(
+                    dim=1,
+                    index=top_i.reshape(B, seq * _top_k)
+                    .unsqueeze(-1)
+                    .expand(B, seq * _top_k, d_head),
+                ).reshape(
+                    B, seq, _top_k, d_head
+                )  # (B,seq,_top_k,d)
+
+                # Repeat queries to align with (t, selected s)
+                q_rep = queries.unsqueeze(2).expand(
+                    B, seq, _top_k, d_head
+                )  # (B,seq,_top_k,d)
+
+                q_vecs = q_rep[final_mask].cpu()
+                k_vecs = k_gather[final_mask].cpu()
+                attn_weights = top_v[final_mask].cpu()
+
+                all_queries[idx].append(q_vecs)
+                all_keys[idx].append(k_vecs)
+                all_weights[idx].append(attn_weights)
+
+            # del cache
+            # torch.cuda.empty_cache()
+
+        final_queries = [torch.cat(xs, dim=0) for xs in all_queries]
+        final_keys = [torch.cat(xs, dim=0) for xs in all_keys]
+        final_weights = [torch.cat(xs, dim=0) for xs in all_weights]
+        return final_queries, final_keys, final_weights
 
 
 def extract_token_ids_sample_ids_and_labels(
@@ -214,12 +258,12 @@ def extract_token_ids_sample_ids_and_labels(
         labels = batch["label"]
 
         # Tokenize the prompts (using left padding to be consistent)
-        tokens = to_tokens(prompts, padding_side="left")
+        tokenized = to_tokens(act_generator.model.tokenizer, prompts)
 
-        input_ids = tokens.to(act_generator.data_device)
+        input_ids = tokenized["input_ids"].to(act_generator.data_device)
+        attention_mask = tokenized["attention_mask"].to(act_generator.data_device)
         pad_token_id = act_generator.model.tokenizer.pad_token_id
         bos_token_id = act_generator.model.tokenizer.bos_token_id
-        attention_mask = (input_ids != pad_token_id) & (input_ids != bos_token_id)
 
         # Count non-padding tokens per sample and repeat labels accordingly
         num_non_padding = attention_mask.sum(dim=1).squeeze()
@@ -269,7 +313,7 @@ def extract_token_ids_and_sample_ids(
         prompts = batch["prompt"]
 
         # Tokenize the prompts (using left padding to be consistent)
-        tokens = act_generator.model.to_tokens(prompts, padding_side="left")
+        tokens = to_tokens(act_generator.model.tokenizer, prompts)
         input_ids = tokens.to(act_generator.data_device)
 
         # Create attention mask ignoring PAD and BOS
