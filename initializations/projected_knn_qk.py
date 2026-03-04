@@ -35,7 +35,9 @@ class WeightedReservoirSampler:
         pool, keys = None, None
         filled = 0
 
-        for _q, _k in loader:
+        for batch in loader:
+            _q = batch[0]
+            _k = batch[1]
             if self.query_or_key == "query":
                 x = _q
             else:
@@ -396,7 +398,9 @@ def lloyd_refine_projected(
         sums = torch.zeros((k, D), device=device, dtype=torch.float32)
         counts = torch.zeros((k,), device=device, dtype=torch.float32)
 
-        for _q, _k in loader:
+        for batch in loader:
+            _q = batch[0]
+            _k = batch[1]
             if query_or_key == "query":
                 x = _q
             elif query_or_key == "key":
@@ -512,7 +516,9 @@ class ReservoirKMeans:
             sums = torch.zeros_like(C, dtype=torch.float32)
             counts = torch.zeros(C.size(0), device=device, dtype=torch.float32)
 
-            for _q, _k in loader:
+            for batch in loader:
+                _q = batch[0]
+                _k = batch[1]
                 if query_or_key == "query":
                     x = _q
                 elif query_or_key == "key":

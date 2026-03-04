@@ -53,15 +53,33 @@ query_vecs, key_vecs, attn_weights = qk_generator.generate_query_key_vecs(
 
 # %%
 
-q_all = query_vecs[0][0:250_000]
-k_all = key_vecs[0][0:250_000]
-
+q_all = query_vecs[0]
+k_all = key_vecs[0]
 full_ds = TensorDataset(q_all, k_all)
 
-loader = DataLoader(
+# Split into train/validation once so all downstream steps use the same partition.
+val_frac = 0.1
+val_size = max(1, int(len(full_ds) * val_frac))
+train_size = len(full_ds) - val_size
+if train_size <= 0:
+    raise ValueError("Not enough samples to create both train and validation splits.")
+
+train_ds, val_ds = random_split(
     full_ds,
+    [train_size, val_size],
+    generator=torch.Generator().manual_seed(42),
+)
+
+train_loader = DataLoader(
+    train_ds,
     batch_size=128,
     shuffle=True,  # always shuffle your training set
+    pin_memory=True,
+)
+val_loader = DataLoader(
+    val_ds,
+    batch_size=128,
+    shuffle=False,
     pin_memory=True,
 )
 
@@ -78,9 +96,6 @@ loader = DataLoader(
 # %%
 
 
-pool_size = round(len(loader.dataset) / 5)
-
-
 # We use 500 centroids, this is an arbitrary number and you can reduce it to capture more broad subspaces or increase to produce more semantic covariances.
 #
 # Should run in 3-5 minutes. For shorter runtime, sample points as the centroids (second cell)
@@ -88,6 +103,16 @@ pool_size = round(len(loader.dataset) / 5)
 # %%
 
 
+q_subset = query_vecs[0][0:250_000]
+k_subset = key_vecs[0][0:250_000]
+subset_ds = TensorDataset(q_subset, k_subset)
+knn_loader = DataLoader(
+    subset_ds,
+    batch_size=128,
+    shuffle=True,  # always shuffle your training set
+    pin_memory=True,
+)
+pool_size = round(len(knn_loader.dataset) / 5)
 num_centroids = min(500, pool_size)
 vocab_size = qk_generator.model.config.vocab_size
 
@@ -99,7 +124,7 @@ knn_q = ReservoirKMeans(
     device=model_device,
     proj_dim=32,
 )
-q_centroids = knn_q.fit(loader)
+q_centroids = knn_q.fit(knn_loader)
 
 knn_k = ReservoirKMeans(
     num_centroids,
@@ -109,20 +134,10 @@ knn_k = ReservoirKMeans(
     device=model_device,
     proj_dim=32,
 )
-k_centroids = knn_k.fit(loader)
+k_centroids = knn_k.fit(knn_loader)
 
 
 # %%
-
-
-# random points
-# N = query_vecs[0].shape[0]
-# idx = torch.randperm(N, device=query_vecs[0].device)[
-#    :num_centroids
-# ]  # sample without replacement
-# q_centroids = query_vecs[0][idx]
-# k_centroids = key_vecs[0][idx]
-
 
 # ### Training
 #
@@ -139,4 +154,4 @@ k_centroids = knn_k.fit(loader)
 model = QKMFA(q_centroids=q_centroids, k_centroids=k_centroids, rank=10).to(
     model_device
 )
-train_nll(model, loader, epochs=30, lr=1e-3)
+train_nll(model, train_loader, val_loader=val_loader, epochs=10, lr=1e-3)

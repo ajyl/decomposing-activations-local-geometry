@@ -1,0 +1,40 @@
+seed: 42
+
+data:
+  source: "toy_mixture"
+  data_device: "cuda"
+  model_device: "cuda"
+  max_pairs: 1_000_000
+  toy_mixture:
+    num_samples: 1_000_000
+    num_components: 20
+    dq: 64
+    dk: 64
+    rank: 8
+    snr: 3.5
+
+split:
+  train_batch_size: 128
+  val_frac: 0.1
+
+knn:
+  pool_frac: 0.2
+  num_centroids: 20
+  num_samples: 200_000
+  proj_dim: 32
+  metric: "euclidean"
+  kmeans_iters: 50
+  kmeans_restarts: 10
+  tol: 0.0001
+  refine_epochs: 25
+
+mfa:
+  rank: 10
+  epochs: 50
+  lr: 0.001
+  grad_clip: null
+  lambda_nuc: 0.001
+
+output:
+  output_dir: "./runs"
+  run_name: "qk_toy_example"

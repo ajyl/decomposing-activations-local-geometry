@@ -1,0 +1,45 @@
+seed: 42
+
+data:
+  source: "llm"  # "llm" or "toy_mixture"
+  data_path: "./data/supervised.json"
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  heads:
+    - [16, 1]
+  data_device: "auto"
+  model_device: "auto"
+  max_pairs: 250000
+  qk_batch_size: 16
+  top_k: 8
+  attn_min: 0.01
+  toy_mixture:
+    num_samples: 50000
+    num_components: 8
+    dq: 128
+    dk: 128
+    rank: 8
+    snr: 3.0
+
+split:
+  train_batch_size: 128
+  val_frac: 0.1
+
+knn:
+  pool_frac: 0.2
+  num_centroids: 500
+  proj_dim: 32
+  metric: "euclidean"
+  kmeans_iters: 50
+  kmeans_restarts: 10
+  tol: 0.0001
+  refine_epochs: 25
+
+mfa:
+  rank: 10
+  epochs: 30
+  lr: 0.001
+  grad_clip: null
+
+output:
+  output_dir: "./runs"
+  run_name: null

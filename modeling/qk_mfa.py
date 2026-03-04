@@ -19,6 +19,7 @@ class QKMFA(nn.Module):
         psi_per_component: bool = False,  # True => Psi_k per component; False => shared Psi
         scale_init: float = 1.0,  # initial loading scales s_{k,j}
         eps_floor: float = 1e-5,  # numerical floor for positivity / norms
+        lambda_nuc: float = 1e-4,
     ):
         super().__init__()
         if q_centroids.ndim != 2:
@@ -37,6 +38,7 @@ class QKMFA(nn.Module):
         self.n_components, self.d_head, self.rank = n_components, d_head, rank
         self._two_pi_logD = self.d_head * math.log(2.0 * math.pi)
         self._eps = float(eps_floor)
+        self.lambda_nuc = float(lambda_nuc)
 
         # Means  (n_components, d_head)
         self.mu_q = nn.Parameter(q_centroids.clone())
@@ -254,7 +256,12 @@ class QKMFA(nn.Module):
         return torch.logsumexp(ll + log_pi[None, :], dim=1)
 
     def nll(self, _q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        return (-self.log_prob(_q, k)).mean()
+        nll = (-self.log_prob(_q, k)).mean()
+        if self.lambda_nuc == 0.0:
+            reg = 0.0
+        else:
+            reg = self.nuclear_norm(weight_by_pi=True)
+        return nll + self.lambda_nuc * reg
 
     def component_posterior(
         self, _q: torch.Tensor, k: torch.Tensor
@@ -287,6 +294,19 @@ class QKMFA(nn.Module):
     def forward(self, _q, k):
         return self.nll(_q, k)
 
+    def nuclear_norm(self, weight_by_pi: bool = True):
+        if weight_by_pi:
+            w = F.softmax(self.pi_logits, dim=0)
+        else:
+            w = torch.ones_like(self.pi_logits)
+
+        reg = 0.0
+        A, B = self._A_B()
+        for c in range(self.n_components):
+            C = A[c] @ B[c].T  # (d_head, d_head)
+            s = torch.linalg.svdvals(C)
+            reg = reg + w[c] * s.sum()
+        return reg
 
 def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
     """
