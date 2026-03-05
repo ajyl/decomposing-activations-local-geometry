@@ -250,13 +250,17 @@ class QKMFA(nn.Module):
         log_pi = F.log_softmax(self.pi_logits, dim=0)[None, :]
         return F.softmax((ll + log_pi) / float(tau), dim=1)
 
-    def log_prob(self, _q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    def log_prob(
+        self, _q: torch.Tensor, k: torch.Tensor, tau: float = 1.0
+    ) -> torch.Tensor:
         ll, *_ = self._core(_q, k)
         log_pi = F.log_softmax(self.pi_logits, dim=0)  # (n_components,)
-        return torch.logsumexp(ll + log_pi[None, :], dim=1)
+        a = ll + log_pi[None, :]
+        tau = float(tau)
+        return tau * torch.logsumexp(a / tau, dim=1)
 
-    def nll(self, _q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        nll = (-self.log_prob(_q, k)).mean()
+    def nll(self, _q: torch.Tensor, k: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+        nll = (-self.log_prob(_q, k, tau=tau)).mean()
         if self.lambda_nuc == 0.0:
             reg = 0.0
         else:
@@ -303,10 +307,19 @@ class QKMFA(nn.Module):
         reg = 0.0
         A, B = self._A_B()
         for c in range(self.n_components):
-            C = A[c] @ B[c].T  # (d_head, d_head)
-            s = torch.linalg.svdvals(C)
+            # C = A[c] @ B[c].T  # (d_head, d_head)
+            # s = torch.linalg.svdvals(C)
+            # reg = reg + w[c] * s.sum()
+            _A = A[c]
+            _B = B[c]
+            _, RA = torch.linalg.qr(_A, mode="reduced")
+            _, RB = torch.linalg.qr(_B, mode="reduced")
+            M = RA @ RB.T
+            s = torch.linalg.svdvals(M)
             reg = reg + w[c] * s.sum()
+
         return reg
+
 
 def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
     """

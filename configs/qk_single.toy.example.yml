@@ -4,13 +4,14 @@ data:
   source: "toy_mixture"
   data_device: "cuda"
   model_device: "cuda"
-  max_pairs: 1_000_000
+  max_pairs: 2_000_000
   toy_mixture:
-    num_samples: 1_000_000
-    num_components: 20
+    num_samples: 2_000_000
+    num_components: 12
     dq: 64
     dk: 64
-    rank: 8
+    min_rank: 3
+    max_rank: 8
     snr: 3.5
 
 split:
@@ -19,7 +20,9 @@ split:
 
 knn:
   pool_frac: 0.2
-  num_centroids: 20
+  num_centroids: 12
+  init_from_groundtruth_means: true  # set true to initialize MFA means from toy generator mu_q/mu_k
+  extra_random_means: 10             # append N random means to the ground-truth means
   num_samples: 200_000
   proj_dim: 32
   metric: "euclidean"
@@ -30,10 +33,17 @@ knn:
 
 mfa:
   rank: 10
-  epochs: 50
+  epochs: 20
   lr: 0.001
   grad_clip: null
-  lambda_nuc: 0.001
+  #lambda_nuc: 0.001
+  lambda_nuc: 0.0
+  tau_scheduler:
+    type: "exp"      # "linear", "cosine", or "exp"
+    tau_start: 1.0
+    tau_end: 1.0
+    warmup_steps: 1_000
+    anneal_steps: null  # null => use all training steps after warmup
 
 output:
   output_dir: "./runs"

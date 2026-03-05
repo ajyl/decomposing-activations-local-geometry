@@ -15,7 +15,7 @@ from dgp.mixture import sample_mixture_pcca
 from initializations.projected_knn_qk import ReservoirKMeans
 from llm_utils.qk_generator import QKGenerator
 from modeling.qk_mfa import QKMFA
-from modeling.train_qk import train_nll
+from modeling.train_qk import _eval_nll, train_nll
 
 
 def resolve_device(name: str) -> str:
@@ -101,6 +101,13 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("`data.max_pairs` must be > 0.")
     if int(cfg["knn"]["num_centroids"]) <= 0:
         raise ValueError("`knn.num_centroids` must be > 0.")
+    if "init_from_groundtruth_means" in cfg["knn"] and not isinstance(
+        cfg["knn"]["init_from_groundtruth_means"], bool
+    ):
+        raise ValueError("`knn.init_from_groundtruth_means` must be a boolean.")
+    if "extra_random_means" in cfg["knn"]:
+        if int(cfg["knn"]["extra_random_means"]) < 0:
+            raise ValueError("`knn.extra_random_means` must be >= 0.")
     if "num_samples" in cfg["knn"] and cfg["knn"]["num_samples"] is not None:
         if int(cfg["knn"]["num_samples"]) <= 0:
             raise ValueError("`knn.num_samples` must be > 0 when provided.")
@@ -108,10 +115,49 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("`mfa.rank` must be > 0.")
     if int(cfg["mfa"]["epochs"]) <= 0:
         raise ValueError("`mfa.epochs` must be > 0.")
+    if float(cfg["mfa"]["lambda_nuc"]) < 0.0:
+        raise ValueError("`mfa.lambda_nuc` must be >= 0.")
+
+    tau_sched = cfg["mfa"].get("tau_scheduler", {})
+    if tau_sched is None:
+        tau_sched = {}
+    if not isinstance(tau_sched, dict):
+        raise ValueError("`mfa.tau_scheduler` must be a mapping/object.")
+    tau_kind = str(tau_sched.get("type", "linear")).lower()
+    if tau_kind not in {"linear", "cosine", "exp"}:
+        raise ValueError(
+            "`mfa.tau_scheduler.type` must be one of: linear, cosine, exp."
+        )
+    tau_start = float(tau_sched.get("tau_start", 1.0))
+    tau_end = float(tau_sched.get("tau_end", 1.0))
+    if tau_start <= 0.0 or tau_end <= 0.0:
+        raise ValueError("`mfa.tau_scheduler.tau_start` and `tau_end` must be > 0.")
+    warmup_steps = int(tau_sched.get("warmup_steps", 0))
+    if warmup_steps < 0:
+        raise ValueError("`mfa.tau_scheduler.warmup_steps` must be >= 0.")
+    if "anneal_steps" in tau_sched and tau_sched["anneal_steps"] is not None:
+        if int(tau_sched["anneal_steps"]) <= 0:
+            raise ValueError(
+                "`mfa.tau_scheduler.anneal_steps` must be > 0 when provided."
+            )
 
     data_source = str(cfg["data"].get("source", "llm"))
     if data_source not in {"llm", "toy_mixture"}:
         raise ValueError("`data.source` must be either 'llm' or 'toy_mixture'.")
+    if bool(cfg["knn"].get("init_from_groundtruth_means", False)) and (
+        data_source != "toy_mixture"
+    ):
+        raise ValueError(
+            "`knn.init_from_groundtruth_means` can only be used when "
+            "`data.source` is 'toy_mixture'."
+        )
+    if int(cfg["knn"].get("extra_random_means", 0)) > 0 and not bool(
+        cfg["knn"].get("init_from_groundtruth_means", False)
+    ):
+        raise ValueError(
+            "`knn.extra_random_means` requires "
+            "`knn.init_from_groundtruth_means: true`."
+        )
 
     if data_source == "toy_mixture":
         toy = cfg["data"].get("toy_mixture")
@@ -119,7 +165,7 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(
                 "`data.toy_mixture` must be provided for source='toy_mixture'."
             )
-        required_toy = ["num_samples", "num_components", "dq", "dk", "rank", "snr"]
+        required_toy = ["num_samples", "num_components", "dq", "dk", "snr"]
         toy_missing = [k for k in required_toy if k not in toy]
         if toy_missing:
             raise ValueError(f"Missing toy mixture config fields: {toy_missing}")
@@ -131,8 +177,35 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(
                 "`data.toy_mixture.dq` and `data.toy_mixture.dk` must be > 0."
             )
-        if int(toy["rank"]) <= 0:
-            raise ValueError("`data.toy_mixture.rank` must be > 0.")
+        has_rank = "rank" in toy
+        has_min_rank = "min_rank" in toy
+        has_max_rank = "max_rank" in toy
+        if has_rank and (has_min_rank or has_max_rank):
+            raise ValueError(
+                "Provide either `data.toy_mixture.rank` or `data.toy_mixture.min_rank`/`max_rank`, not both."
+            )
+        if has_rank:
+            if int(toy["rank"]) <= 0:
+                raise ValueError("`data.toy_mixture.rank` must be > 0.")
+        else:
+            if not (has_min_rank and has_max_rank):
+                raise ValueError(
+                    "Provide either `data.toy_mixture.rank` or both `data.toy_mixture.min_rank` and `data.toy_mixture.max_rank`."
+                )
+            min_rank = int(toy["min_rank"])
+            max_rank = int(toy["max_rank"])
+            if min_rank <= 0 or max_rank <= 0:
+                raise ValueError(
+                    "`data.toy_mixture.min_rank` and `data.toy_mixture.max_rank` must be > 0."
+                )
+            if min_rank > max_rank:
+                raise ValueError(
+                    "`data.toy_mixture.min_rank` must be <= `data.toy_mixture.max_rank`."
+                )
+            if max_rank > min(int(toy["dq"]), int(toy["dk"])):
+                raise ValueError(
+                    "`data.toy_mixture.max_rank` must be <= min(`dq`, `dk`)."
+                )
         if float(toy["snr"]) <= 0.0:
             raise ValueError("`data.toy_mixture.snr` must be > 0.")
         if int(toy["dq"]) != int(toy["dk"]):
@@ -161,7 +234,8 @@ def get_default_config() -> dict:
                 "num_components": 8,
                 "dq": 128,
                 "dk": 128,
-                "rank": 8,
+                "min_rank": 4,
+                "max_rank": 8,
                 "snr": 3.0,
             },
         },
@@ -173,6 +247,8 @@ def get_default_config() -> dict:
             "pool_frac": 0.2,
             "num_centroids": 500,
             "num_samples": None,
+            "init_from_groundtruth_means": False,
+            "extra_random_means": 0,
             "proj_dim": 32,
             "metric": "euclidean",
             "kmeans_iters": 50,
@@ -185,6 +261,14 @@ def get_default_config() -> dict:
             "epochs": 30,
             "lr": 1e-3,
             "grad_clip": None,
+            "lambda_nuc": 1e-4,
+            "tau_scheduler": {
+                "type": "linear",
+                "tau_start": 1.0,
+                "tau_end": 1.0,
+                "warmup_steps": 0,
+                "anneal_steps": None,
+            },
         },
         "output": {
             "output_dir": "./runs",
@@ -281,15 +365,21 @@ def main() -> None:
         toy_cfg = data_cfg["toy_mixture"]
         toy_device = model_device
         print("[run] Generating toy mixture query/key vectors...")
+        rank_kwargs = {}
+        if "rank" in toy_cfg:
+            rank_kwargs["r"] = int(toy_cfg["rank"])
+        else:
+            rank_kwargs["min_rank"] = int(toy_cfg["min_rank"])
+            rank_kwargs["max_rank"] = int(toy_cfg["max_rank"])
         q_all, k_all, c_all, toy_params = sample_mixture_pcca(
             N=int(toy_cfg["num_samples"]),
             K=int(toy_cfg["num_components"]),
             dq=int(toy_cfg["dq"]),
             dk=int(toy_cfg["dk"]),
-            r=int(toy_cfg["rank"]),
             snr=float(toy_cfg["snr"]),
             device=toy_device,
             seed=seed,
+            **rank_kwargs,
         )
         max_pairs = int(data_cfg["max_pairs"])
         q_all = q_all[:max_pairs]
@@ -350,63 +440,104 @@ def main() -> None:
             pin_memory=pin_memory,
         )
 
-    knn_num_samples_raw = knn_cfg.get("num_samples")
-    if knn_num_samples_raw is None:
-        knn_ds = train_ds
+    init_from_groundtruth = bool(knn_cfg.get("init_from_groundtruth_means", False))
+    if init_from_groundtruth:
+        if toy_params is None:
+            raise ValueError(
+                "Ground-truth centroid initialization requires toy mixture params."
+            )
+        q_mu_true = toy_params["mu_q"].detach().to(model_device, dtype=torch.float32)
+        k_mu_true = toy_params["mu_k"].detach().to(model_device, dtype=torch.float32)
+        extra_random_means = int(knn_cfg.get("extra_random_means", 0))
+
+        if extra_random_means > 0:
+            q_mean = q_mu_true.mean(dim=0, keepdim=True)
+            k_mean = k_mu_true.mean(dim=0, keepdim=True)
+            q_std = q_mu_true.std(dim=0, keepdim=True).clamp_min(1e-6)
+            k_std = k_mu_true.std(dim=0, keepdim=True).clamp_min(1e-6)
+            q_rand = torch.randn(
+                extra_random_means,
+                q_mu_true.size(1),
+                device=q_mu_true.device,
+                dtype=q_mu_true.dtype,
+            )
+            k_rand = torch.randn(
+                extra_random_means,
+                k_mu_true.size(1),
+                device=k_mu_true.device,
+                dtype=k_mu_true.dtype,
+            )
+            q_rand = q_rand * q_std + q_mean
+            k_rand = k_rand * k_std + k_mean
+            q_centroids = torch.cat([q_mu_true, q_rand], dim=0)
+            k_centroids = torch.cat([k_mu_true, k_rand], dim=0)
+        else:
+            q_centroids = q_mu_true
+            k_centroids = k_mu_true
+
+        print(
+            "[run] Initializing centroids from toy mixture ground truth means "
+            f"(groundtruth={q_mu_true.size(0)}, random_extra={extra_random_means}, "
+            f"num_centroids={q_centroids.size(0)})..."
+        )
     else:
-        knn_num_samples = min(int(knn_num_samples_raw), len(train_ds))
-        knn_indices = torch.randperm(len(train_ds), generator=torch.Generator().manual_seed(seed))[
-            :knn_num_samples
-        ]
-        knn_ds = Subset(train_ds, knn_indices.tolist())
+        knn_num_samples_raw = knn_cfg.get("num_samples")
+        if knn_num_samples_raw is None:
+            knn_ds = train_ds
+        else:
+            knn_num_samples = min(int(knn_num_samples_raw), len(train_ds))
+            knn_indices = torch.randperm(
+                len(train_ds), generator=torch.Generator().manual_seed(seed)
+            )[:knn_num_samples]
+            knn_ds = Subset(train_ds, knn_indices.tolist())
 
-    knn_loader = DataLoader(
-        knn_ds,
-        batch_size=train_batch_size,
-        shuffle=False,
-        pin_memory=pin_memory,
-    )
-
-    pool_size = max(1, round(len(knn_loader.dataset) * float(knn_cfg["pool_frac"])))
-    num_centroids = min(int(knn_cfg["num_centroids"]), pool_size)
-    if num_centroids < 1:
-        raise ValueError(
-            "No centroids can be initialized with current dataset/pool size."
+        knn_loader = DataLoader(
+            knn_ds,
+            batch_size=train_batch_size,
+            shuffle=False,
+            pin_memory=pin_memory,
         )
 
-    print(
-        f"[run] Initializing centroids with knn_samples={len(knn_loader.dataset)}, "
-        f"pool_size={pool_size}, num_centroids={num_centroids}..."
-    )
-    knn_q = ReservoirKMeans(
-        n_clusters=num_centroids,
-        pool_size=pool_size,
-        query_or_key="query",
-        vocab_size=vocab_size,
-        seed=seed,
-        device=model_device,
-        metric=str(knn_cfg["metric"]),
-        proj_dim=int(knn_cfg["proj_dim"]),
-        kmeans_iters=int(knn_cfg["kmeans_iters"]),
-        kmeans_restarts=int(knn_cfg["kmeans_restarts"]),
-        tol=float(knn_cfg["tol"]),
-    )
-    q_centroids = knn_q.fit(knn_loader, refine_epochs=int(knn_cfg["refine_epochs"]))
+        pool_size = max(1, round(len(knn_loader.dataset) * float(knn_cfg["pool_frac"])))
+        num_centroids = min(int(knn_cfg["num_centroids"]), pool_size)
+        if num_centroids < 1:
+            raise ValueError(
+                "No centroids can be initialized with current dataset/pool size."
+            )
 
-    knn_k = ReservoirKMeans(
-        n_clusters=num_centroids,
-        pool_size=pool_size,
-        query_or_key="key",
-        vocab_size=vocab_size,
-        seed=seed,
-        device=model_device,
-        metric=str(knn_cfg["metric"]),
-        proj_dim=int(knn_cfg["proj_dim"]),
-        kmeans_iters=int(knn_cfg["kmeans_iters"]),
-        kmeans_restarts=int(knn_cfg["kmeans_restarts"]),
-        tol=float(knn_cfg["tol"]),
-    )
-    k_centroids = knn_k.fit(knn_loader, refine_epochs=int(knn_cfg["refine_epochs"]))
+        print(
+            f"[run] Initializing centroids with knn_samples={len(knn_loader.dataset)}, "
+            f"pool_size={pool_size}, num_centroids={num_centroids}..."
+        )
+        knn_q = ReservoirKMeans(
+            n_clusters=num_centroids,
+            pool_size=pool_size,
+            query_or_key="query",
+            vocab_size=vocab_size,
+            seed=seed,
+            device=model_device,
+            metric=str(knn_cfg["metric"]),
+            proj_dim=int(knn_cfg["proj_dim"]),
+            kmeans_iters=int(knn_cfg["kmeans_iters"]),
+            kmeans_restarts=int(knn_cfg["kmeans_restarts"]),
+            tol=float(knn_cfg["tol"]),
+        )
+        q_centroids = knn_q.fit(knn_loader, refine_epochs=int(knn_cfg["refine_epochs"]))
+
+        knn_k = ReservoirKMeans(
+            n_clusters=num_centroids,
+            pool_size=pool_size,
+            query_or_key="key",
+            vocab_size=vocab_size,
+            seed=seed,
+            device=model_device,
+            metric=str(knn_cfg["metric"]),
+            proj_dim=int(knn_cfg["proj_dim"]),
+            kmeans_iters=int(knn_cfg["kmeans_iters"]),
+            kmeans_restarts=int(knn_cfg["kmeans_restarts"]),
+            tol=float(knn_cfg["tol"]),
+        )
+        k_centroids = knn_k.fit(knn_loader, refine_epochs=int(knn_cfg["refine_epochs"]))
 
     model = QKMFA(
         q_centroids=q_centroids,
@@ -425,6 +556,14 @@ def main() -> None:
         grad_clip=mfa_cfg["grad_clip"],
         eval_loader=val_metrics_loader,
         eval_targets={"toy_params": toy_params} if toy_params is not None else None,
+        tau_schedule=mfa_cfg.get("tau_scheduler"),
+    )
+    train_metrics = _eval_nll(
+        model,
+        train_loader,
+        model_device,
+        eval_targets={"toy_params": toy_params} if toy_params is not None else None,
+        tau=float(metrics.get("tau_final", 1.0)),
     )
 
     torch.save(
@@ -432,12 +571,21 @@ def main() -> None:
         run_dir / "centroids.pt",
     )
     if toy_params is not None:
+        _toy_params = {}
+        for k, v in toy_params.items():
+            if isinstance(v, torch.Tensor):
+                _toy_params[k] = v.detach().cpu()
+            else:
+                _toy_params[k] = v
         torch.save(
-            {k: v.detach().cpu() for k, v in toy_params.items()},
+            _toy_params,
             run_dir / "toy_params.pt",
         )
     torch.save(model.state_dict(), run_dir / "model_state.pt")
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    (run_dir / "train_metrics.json").write_text(
+        json.dumps(train_metrics, indent=2) + "\n"
+    )
 
     print("[run] Done.")
     print(json.dumps(metrics, indent=2))

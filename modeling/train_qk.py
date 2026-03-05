@@ -3,6 +3,57 @@ import torch.nn.functional as F
 from modeling.mfa import save_mfa
 from tqdm import tqdm
 import itertools
+import math
+
+
+def _build_tau_schedule(total_steps: int, tau_schedule: dict | None):
+    cfg = dict(tau_schedule or {})
+    kind = str(cfg.get("type", "linear")).lower()
+    tau_start = float(cfg.get("tau_start", 1.0))
+    tau_end = float(cfg.get("tau_end", 1.0))
+    warmup_steps = int(cfg.get("warmup_steps", 0))
+    anneal_steps_raw = cfg.get("anneal_steps", None)
+
+    if total_steps <= 0:
+        raise ValueError("`total_steps` must be > 0 for tau scheduling.")
+    if tau_start <= 0.0 or tau_end <= 0.0:
+        raise ValueError("`tau_start` and `tau_end` must both be > 0.")
+    if warmup_steps < 0:
+        raise ValueError("`warmup_steps` must be >= 0.")
+    if kind not in {"linear", "cosine", "exp"}:
+        raise ValueError("`tau_schedule.type` must be one of: linear, cosine, exp.")
+
+    if anneal_steps_raw is None:
+        anneal_steps = max(1, total_steps - warmup_steps)
+    else:
+        anneal_steps = int(anneal_steps_raw)
+        if anneal_steps <= 0:
+            raise ValueError("`tau_schedule.anneal_steps` must be > 0 when provided.")
+
+    def get_tau(step: int) -> float:
+        s = max(0, int(step))
+        if s < warmup_steps:
+            return tau_start
+
+        p = (s - warmup_steps) / float(max(1, anneal_steps))
+        p = min(max(p, 0.0), 1.0)
+
+        if kind == "linear":
+            return tau_start + (tau_end - tau_start) * p
+        if kind == "cosine":
+            return tau_end + (tau_start - tau_end) * 0.5 * (1.0 + math.cos(math.pi * p))
+        # kind == "exp"
+        return tau_start * ((tau_end / tau_start) ** p)
+
+    schedule_meta = {
+        "type": kind,
+        "tau_start": tau_start,
+        "tau_end": tau_end,
+        "warmup_steps": warmup_steps,
+        "anneal_steps": anneal_steps,
+        "total_steps": int(total_steps),
+    }
+    return get_tau, schedule_meta
 
 
 def _batch_qk_and_labels(batch):
@@ -57,7 +108,7 @@ def _cpu_state_dict(model):
 
 
 @torch.no_grad()
-def _eval_nll(model, loader, device, *, eval_targets=None):
+def _eval_nll(model, loader, device, *, eval_targets=None, tau: float = 1.0):
     model.eval()
     tot_nll, tot_q_mse, tot_k_mse, tot_n = 0.0, 0.0, 0.0, 0
     pred_labels = []
@@ -66,7 +117,7 @@ def _eval_nll(model, loader, device, *, eval_targets=None):
         _q, _k, labels = _batch_qk_and_labels(batch)
         _q = _q.view(_q.size(0), -1).to(device)
         _k = _k.view(_k.size(0), -1).to(device)
-        nll = model.nll(_q, _k)  # mean over batch
+        nll = model.nll(_q, _k, tau=tau)  # mean over batch
         q_hat, k_hat = model.reconstruct(_q, _k, use_mixture_mean=True)
         B = _q.size(0)
         tot_nll += nll.item() * B
@@ -75,7 +126,7 @@ def _eval_nll(model, loader, device, *, eval_targets=None):
         tot_n += B
         if labels is not None:
             pred_labels.append(
-                model.responsibilities(_q, _k).argmax(dim=1).detach().cpu()
+                model.responsibilities(_q, _k, tau=tau).argmax(dim=1).detach().cpu()
             )
             true_labels.append(labels.detach().view(-1).cpu())
 
@@ -126,6 +177,21 @@ def _eval_nll(model, loader, device, *, eval_targets=None):
         mu_k_true = tp["mu_k"].to(device)
         A_true = tp["A"].to(device)
         B_true = tp["B"].to(device)
+        pi_true = tp.get("pi")
+        if pi_true is not None:
+            pi_true = pi_true.to(device).float()
+        pi_hat = torch.softmax(model.pi_logits.detach().float(), dim=0)
+        trained_pi_list = [float(x) for x in pi_hat.cpu().tolist()]
+        out["trained_pi"] = trained_pi_list
+        gt_pi_list = None
+        if pi_true is not None:
+            gt_pi_list = [float(x) for x in pi_true.cpu().tolist()]
+            out["gt_pi"] = gt_pi_list
+        gt_component_ranks = tp.get("component_ranks")
+        gt_ranks_list = None
+        if gt_component_ranks is not None:
+            gt_component_ranks = gt_component_ranks.to(device).long()
+            gt_ranks_list = [int(x) for x in gt_component_ranks.cpu().tolist()]
 
         mu_q_hat = model.mu_q.detach()
         mu_k_hat = model.mu_k.detach()
@@ -149,31 +215,70 @@ def _eval_nll(model, loader, device, *, eval_targets=None):
             out["mean_err_q"] = (mu_q_hat - mu_q_true).norm(dim=1).mean().item()
             out["mean_err_k"] = (mu_k_hat - mu_k_true).norm(dim=1).mean().item()
 
-            # coup_err = []
-            # coup_corr = []
-            # sub_a = []
-            # sub_b = []
-            # for c in range(K_true):
-            #    C_true = A_true[c] @ B_true[c].T
-            #    C_hat = A_hat[c] @ B_hat[c].T
-            #    coup_err.append((C_hat - C_true).norm().item())
-            #    coup_corr.append(
-            #        F.cosine_similarity(C_true.flatten(), C_hat.flatten(), dim=0).item()
-            #    )
-            #    #sub_a.append(_subspace_similarity(A_true[c], A_hat[c]))
-            #    #sub_b.append(_subspace_similarity(B_true[c], B_hat[c]))
+            if gt_component_ranks is not None:
+                a_eff_rank99_aligned = [
+                    _effective_rank(torch.linalg.svdvals(A_hat[k]), frac=0.99)
+                    for k in range(K_true)
+                ]
+                b_eff_rank99_aligned = [
+                    _effective_rank(torch.linalg.svdvals(B_hat[k]), frac=0.99)
+                    for k in range(K_true)
+                ]
+                out["gt_component_ranks"] = gt_ranks_list
+                a_eff_rank99_aligned_int = [int(v) for v in a_eff_rank99_aligned]
+                out["A_eff_rank99_aligned"] = a_eff_rank99_aligned_int
+                b_eff_rank99_aligned_int = [int(v) for v in b_eff_rank99_aligned]
+                out["B_eff_rank99_aligned"] = b_eff_rank99_aligned_int
+                if (
+                    gt_pi_list is not None
+                    and len(gt_pi_list) == K_true
+                    and len(trained_pi_list) == K_true
+                ):
+                    gt_pi_order = sorted(range(K_true), key=lambda i: gt_pi_list[i])
+                    tr_pi_order = sorted(
+                        range(K_true), key=lambda i: trained_pi_list[i]
+                    )
+                    out["pi_indexed_rank_rows"] = [
+                        (
+                            f"i={i:02d} "
+                            f"gt_idx={gt_idx:02d} tr_idx={tr_idx:02d} "
+                            f"gt_pi={gt_pi_list[gt_idx]:.6f} tr_pi={trained_pi_list[tr_idx]:.6f} | "
+                            f"gt_rank={gt_ranks_list[gt_idx]:2d} "
+                            f"A_eff99={a_eff_rank99_aligned_int[tr_idx]:2d} "
+                            f"B_eff99={b_eff_rank99_aligned_int[tr_idx]:2d}"
+                        )
+                        for i, (gt_idx, tr_idx) in enumerate(zip(gt_pi_order, tr_pi_order))
+                    ]
 
-            # out["coup_err_mean"] = float(sum(coup_err) / K_true)
-            # out["coup_corr_mean"] = float(sum(coup_corr) / K_true)
-            # out["subA"] = float(sum(sub_a) / K_true)
-            # out["subB"] = float(sum(sub_b) / K_true)
         else:
             out["mean_err_q"] = float("nan")
             out["mean_err_k"] = float("nan")
-            # out["coup_err_mean"] = float("nan")
-            # out["coup_corr_mean"] = float("nan")
-            # out["subA"] = float("nan")
-            # out["subB"] = float("nan")
+            if gt_component_ranks is not None and K_true == K_hat and K_true > 0:
+                out["gt_component_ranks"] = gt_ranks_list
+                a_eff_rank99_int = [int(v) for v in a_eff_rank99]
+                out["A_eff_rank99_aligned"] = a_eff_rank99_int
+                b_eff_rank99_int = [int(v) for v in b_eff_rank99]
+                out["B_eff_rank99_aligned"] = b_eff_rank99_int
+                if (
+                    gt_pi_list is not None
+                    and len(gt_pi_list) == K_true
+                    and len(trained_pi_list) == K_true
+                ):
+                    gt_pi_order = sorted(range(K_true), key=lambda i: gt_pi_list[i])
+                    tr_pi_order = sorted(
+                        range(K_true), key=lambda i: trained_pi_list[i]
+                    )
+                    out["pi_indexed_rank_rows"] = [
+                        (
+                            f"i={i:02d} "
+                            f"gt_idx={gt_idx:02d} tr_idx={tr_idx:02d} "
+                            f"gt_pi={gt_pi_list[gt_idx]:.6f} tr_pi={trained_pi_list[tr_idx]:.6f} | "
+                            f"gt_rank={gt_ranks_list[gt_idx]:2d} "
+                            f"A_eff99={a_eff_rank99_int[tr_idx]:2d} "
+                            f"B_eff99={b_eff_rank99_int[tr_idx]:2d}"
+                        )
+                        for i, (gt_idx, tr_idx) in enumerate(zip(gt_pi_order, tr_pi_order))
+                    ]
 
     return out
 
@@ -192,6 +297,7 @@ def train_nll(
     log_interval=100,
     steps_per_epoch=None,
     eval_targets=None,
+    tau_schedule=None,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -199,6 +305,10 @@ def train_nll(
     """
     device = next(model.parameters()).device
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_steps_per_epoch = int(steps_per_epoch) if steps_per_epoch is not None else len(loader)
+    total_steps = int(epochs) * int(train_steps_per_epoch)
+    tau_at_step, tau_schedule_meta = _build_tau_schedule(total_steps, tau_schedule)
+    global_step = 0
 
     best_metric = float("inf")
     best_state = _cpu_state_dict(model)
@@ -207,6 +317,7 @@ def train_nll(
     for ep in range(1, epochs + 1):
         model.train()
         total_nll, total_n = 0.0, 0
+        last_tau = tau_at_step(global_step)
 
         iterable = enumerate(loader, 1)
         pbar = tqdm(iterable, total=steps_per_epoch)
@@ -215,7 +326,9 @@ def train_nll(
             _q = batch[0]  # [B, d_head]
             _k = batch[1]  # [B, d_head]
             opt.zero_grad(set_to_none=True)
-            nll = model.nll(_q, _k)  # mean over batch
+            tau = tau_at_step(global_step)
+            last_tau = tau
+            nll = model.nll(_q, _k, tau=tau)  # mean over batch
             nll.backward()
 
             if grad_clip is not None:
@@ -230,9 +343,10 @@ def train_nll(
             if (batch_idx % log_interval) == 0:
                 avg_so_far = total_nll / max(1, total_n)
                 pbar.set_description(
-                    f"Epoch {ep:02d} | Step {batch_idx:06d} Train NLL={avg_so_far:.6f}"
+                    f"Epoch {ep:02d} | Step {batch_idx:06d} Train NLL={avg_so_far:.6f} tau={tau:.4f}"
                 )
 
+            global_step += 1
             if steps_per_epoch is not None and batch_idx >= steps_per_epoch:
                 break
 
@@ -244,50 +358,56 @@ def train_nll(
         else:
             avg_train_nll = total_nll / total_n
 
-        if val_loader is not None:
-            eval_dl = eval_loader if eval_loader is not None else val_loader
-            val_metrics = _eval_nll(model, eval_dl, device, eval_targets=eval_targets)
-            val_nll = val_metrics["nll"]
-            select_metric = val_nll
-        else:
-            val_nll = float("nan")
-            val_metrics = {"nll": val_nll, "q_mse": float("nan"), "k_mse": float("nan")}
-            select_metric = avg_train_nll
+        if ep % 1 == 0:
+            if val_loader is not None:
+                eval_dl = eval_loader if eval_loader is not None else val_loader
+                val_metrics = _eval_nll(
+                    model, eval_dl, device, eval_targets=eval_targets, tau=last_tau
+                )
+                val_nll = val_metrics["nll"]
+                select_metric = val_nll
+            else:
+                val_nll = float("nan")
+                val_metrics = {"nll": val_nll, "q_mse": float("nan"), "k_mse": float("nan")}
+                select_metric = avg_train_nll
 
-        improved = (
-            (select_metric < best_metric)
-            if not (torch.isnan(torch.tensor(select_metric)))
-            else False
-        )
-        if improved:
-            best_metric = select_metric
-            best_state = _cpu_state_dict(model)
-            best_epoch = ep
-            if save_path and save_func:
-                save_func(model, save_path)
-
-        print(
-            f"[epoch {ep:02d}] "
-            f"train NLL={avg_train_nll:.6f}  "
-            f"val NLL={val_nll:.6f} "
-            f"val qMSE={val_metrics['q_mse']:.6f} "
-            f"val kMSE={val_metrics['k_mse']:.6f} "
-            f"{'** best **' if improved else ''}"
-        )
-        if "cluster_acc" in val_metrics:
-            print(f"           val cluster_acc={val_metrics['cluster_acc']:.6f}")
-        if "mean_err_q" in val_metrics:
-            print(
-                "           "
-                f"mean_err_q={val_metrics['mean_err_q']:.6f} "
-                f"mean_err_k={val_metrics['mean_err_k']:.6f} "
-                f"A_eff_rank99_mean={val_metrics['A_eff_rank99_mean']:.6f} "
-                f"B_eff_rank99_mean={val_metrics['B_eff_rank99_mean']:.6f} "
-                # f"coup_err={val_metrics['coup_err_mean']:.6f} "
-                # f"coup_corr={val_metrics['coup_corr_mean']:.6f} "
-                # f"subA={val_metrics['subA']:.6f} "
-                # f"subB={val_metrics['subB']:.6f}"
+            improved = (
+                (select_metric < best_metric)
+                if not (torch.isnan(torch.tensor(select_metric)))
+                else False
             )
+            if improved:
+                best_metric = select_metric
+                best_state = _cpu_state_dict(model)
+                best_epoch = ep
+                if save_path and save_func:
+                    save_func(model, save_path)
+
+            print(
+                f"[epoch {ep:02d}] "
+                f"train NLL={avg_train_nll:.6f}  "
+                f"tau={last_tau:.6f} "
+                f"val NLL={val_nll:.6f} "
+                f"val qMSE={val_metrics['q_mse']:.6f} "
+                f"val kMSE={val_metrics['k_mse']:.6f} "
+                f"{'** best **' if improved else ''}"
+            )
+            if "cluster_acc" in val_metrics:
+                print(f"           val cluster_acc={val_metrics['cluster_acc']:.6f}")
+            if "mean_err_q" in val_metrics:
+                print(
+                    "           "
+                    f"mean_err_q={val_metrics['mean_err_q']:.6f} "
+                    f"mean_err_k={val_metrics['mean_err_k']:.6f} "
+                    f"A_eff_rank99_mean={val_metrics['A_eff_rank99_mean']:.6f} "
+                    f"B_eff_rank99_mean={val_metrics['B_eff_rank99_mean']:.6f} "
+                )
+        if "pi_indexed_rank_rows" in val_metrics:
+            print(
+                "           pi-sorted comparison (gt and trained each sorted ascending by their own pi)"
+            )
+            for row in val_metrics["pi_indexed_rank_rows"]:
+                print(f"           {row}")
 
     model.load_state_dict(best_state)
     print(
@@ -295,7 +415,15 @@ def train_nll(
     )
 
     metrics = dict(best_epoch=best_epoch, best_metric=best_metric)
+    metrics["tau_schedule"] = tau_schedule_meta
+    metrics["tau_final"] = float(tau_at_step(global_step))
     if val_loader is not None:
         eval_dl = eval_loader if eval_loader is not None else val_loader
-        metrics["val"] = _eval_nll(model, eval_dl, device, eval_targets=eval_targets)
+        metrics["val"] = _eval_nll(
+            model,
+            eval_dl,
+            device,
+            eval_targets=eval_targets,
+            tau=float(tau_at_step(global_step)),
+        )
     return metrics

@@ -65,7 +65,9 @@ def sample_mixture_pcca(
     K: int,
     dq: int,
     dk: int,
-    r: int,
+    r: int = None,
+    min_rank: int = None,
+    max_rank: int = None,
     snr: float = 3.0,
     device="cpu",
     seed=0,
@@ -73,12 +75,44 @@ def sample_mixture_pcca(
     """
     Generate N samples from:
       c ~ Cat(pi)
-      z ~ N(0, I_r)
+      z ~ N(0, I_max_rank)
       q = mu_q[c] + A[c] z + eps_q, eps_q ~ N(0, diag(psi_q[c]))
       k = mu_k[c] + B[c] z + eps_k, eps_k ~ N(0, diag(psi_k[c]))
+    Each component has an effective latent rank sampled uniformly from
+    [min_rank, max_rank]. If min_rank/max_rank are not provided, falls back
+    to the legacy fixed-rank behavior with r.
     snr controls factor scale vs noise scale.
     """
     set_seed(seed)
+
+    if min_rank is None and max_rank is None:
+        if r is None:
+            raise ValueError("Provide `r` or both `min_rank` and `max_rank`.")
+        min_rank = int(r)
+        max_rank = int(r)
+    elif (min_rank is None) != (max_rank is None):
+        raise ValueError("`min_rank` and `max_rank` must be provided together.")
+    elif r is not None:
+        raise ValueError(
+            "Provide either `r` (fixed rank) or `min_rank`/`max_rank` (rank range), not both."
+        )
+
+    min_rank = int(min_rank)
+    max_rank = int(max_rank)
+    if min_rank <= 0 or max_rank <= 0:
+        raise ValueError("`min_rank` and `max_rank` must be > 0.")
+    if min_rank > max_rank:
+        raise ValueError("`min_rank` must be <= `max_rank`.")
+    if max_rank > min(dq, dk):
+        raise ValueError("`max_rank` must be <= min(dq, dk).")
+
+    latent_dim = max_rank
+    component_ranks = torch.randint(
+        low=min_rank,
+        high=max_rank + 1,
+        size=(K,),
+        device=device,
+    )
 
     # mixture weights
     alpha = torch.ones(K) * 1.0
@@ -90,19 +124,26 @@ def sample_mixture_pcca(
 
     # loadings (random directions + per-factor scales)
     # Make per-component "coupling spectra" somewhat distinct.
-    A = torch.randn(K, dq, r, device=device)
-    B = torch.randn(K, dk, r, device=device)
+    A = torch.randn(K, dq, latent_dim, device=device)
+    B = torch.randn(K, dk, latent_dim, device=device)
 
     # normalize columns
     A = A / (A.norm(dim=1, keepdim=True).clamp_min(1e-6))
     B = B / (B.norm(dim=1, keepdim=True).clamp_min(1e-6))
 
-    # scales: shape (K, r)
+    # scales: shape (K, latent_dim)
     # larger snr => larger factors relative to noise
-    base = torch.linspace(1.0, 0.4, r, device=device)[None, :].repeat(K, 1)
-    scales = snr * base * (0.7 + 0.6 * torch.rand(K, r, device=device))
+    base = torch.linspace(1.0, 0.4, latent_dim, device=device)[None, :].repeat(K, 1)
+    scales = snr * base * (0.7 + 0.6 * torch.rand(K, latent_dim, device=device))
     A = A * scales[:, None, :]
     B = B * scales[:, None, :]
+
+    # Zero out trailing columns so each component has its own effective rank.
+    rank_mask = (
+        torch.arange(latent_dim, device=device)[None, :] < component_ranks[:, None]
+    ).to(A.dtype)
+    A = A * rank_mask[:, None, :]
+    B = B * rank_mask[:, None, :]
 
     # diagonal noise (per component, per dimension)
     # make noise small-ish relative to factor energy
@@ -114,16 +155,26 @@ def sample_mixture_pcca(
     c = cat.sample((N,)).to(device)  # (N,)
 
     # sample z and noise
-    z = torch.randn(N, r, device=device)
-    Aq = A[c]  # (N, dq, r)
-    Bk = B[c]  # (N, dk, r)
+    z = torch.randn(N, latent_dim, device=device)
+    Aq = A[c]  # (N, dq, latent_dim)
+    Bk = B[c]  # (N, dk, latent_dim)
     q = mu_q[c] + torch.einsum("nr,ndr->nd", z, Aq)
     k = mu_k[c] + torch.einsum("nr,ndr->nd", z, Bk)
 
     q = q + torch.randn_like(q) * psi_q[c].sqrt()
     k = k + torch.randn_like(k) * psi_k[c].sqrt()
 
-    params = dict(pi=pi, mu_q=mu_q, mu_k=mu_k, A=A, B=B, psi_q=psi_q, psi_k=psi_k)
+    params = dict(
+        pi=pi,
+        mu_q=mu_q,
+        mu_k=mu_k,
+        A=A,
+        B=B,
+        psi_q=psi_q,
+        psi_k=psi_k,
+        component_ranks=component_ranks,
+        min_rank=min_rank,
+        max_rank=max_rank,
+    )
     return q, k, c, params
-
 

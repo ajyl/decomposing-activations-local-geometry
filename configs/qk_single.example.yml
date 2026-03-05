@@ -17,7 +17,8 @@ data:
     num_components: 8
     dq: 128
     dk: 128
-    rank: 8
+    min_rank: 4
+    max_rank: 8
     snr: 3.0
 
 split:
@@ -27,6 +28,8 @@ split:
 knn:
   pool_frac: 0.2
   num_centroids: 500
+  init_from_groundtruth_means: false  # debug only; requires data.source: "toy_mixture"
+  extra_random_means: 0               # debug only; requires init_from_groundtruth_means: true
   proj_dim: 32
   metric: "euclidean"
   kmeans_iters: 50
@@ -39,6 +42,13 @@ mfa:
   epochs: 30
   lr: 0.001
   grad_clip: null
+  lambda_nuc: 0.0001
+  tau_scheduler:
+    type: "linear"      # "linear", "cosine", or "exp"
+    tau_start: 1.0
+    tau_end: 0.3
+    warmup_steps: 0
+    anneal_steps: null  # null => use all training steps after warmup
 
 output:
   output_dir: "./runs"
