@@ -1,4 +1,4 @@
-seed: 42
+seed: 43
 
 data:
   source: "toy_mixture"
@@ -20,9 +20,9 @@ split:
 
 knn:
   pool_frac: 0.2
-  num_centroids: 12
-  init_from_groundtruth_means: true  # set true to initialize MFA means from toy generator mu_q/mu_k
-  extra_random_means: 10             # append N random means to the ground-truth means
+  num_centroids: 20
+  init_from_groundtruth_means: false  # set true to initialize MFA means from toy generator mu_q/mu_k
+  extra_random_means: 0             # append N random means to the ground-truth means
   num_samples: 200_000
   proj_dim: 32
   metric: "euclidean"
